@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from scipy.optimize import linprog
 
 class PortfolioOptimizer:
-    def __init__(self, tickers, start_date='2020-01-01', end_date=None, freq='1d', risk_free_rate=0.02):
+    def __init__(self, tickers, start_date='2000-01-01', end_date=None, freq='1d', risk_free_rate=0.02):
         self.tickers = tickers
         self.start_date = start_date
         self.end_date = end_date
@@ -262,3 +262,50 @@ class PortfolioOptimizer:
         perf = self.portfolio_performance(w)
     
         return w, perf, res
+
+    def rolling_backtest(self, window=252, rebalance_freq=21, method="sharpe"):
+        weights_hist = []
+        perf_hist = []
+    
+        for start in range(0, len(self.returns)-window, rebalance_freq):
+            train = self.returns.iloc[start:start+window]
+            test = self.returns.iloc[start+window:start+window+rebalance_freq]
+    
+            self.mean_returns = train.mean() * 252
+            self.cov_matrix = train.cov() * 252
+    
+            if method == "sharpe":
+                w, _ = self.optimize_sharpe()
+            elif method == "cvar":
+                w, _ , _ = self.optimize_cvar()
+    
+            strat_ret = test.values @ w
+            perf_hist.append(strat_ret)
+            weights_hist.append(w)
+    
+        self.bt_returns = np.concatenate(perf_hist)
+        return self.bt_returns, np.array(weights_hist)
+
+    def backtest_stats(self):
+        r = self.bt_returns
+        ann_ret = np.mean(r) * 252
+        ann_vol = np.std(r) * np.sqrt(252)
+        sharpe = ann_ret / ann_vol
+        max_dd = np.min(np.cumprod(1+r)/np.maximum.accumulate(np.cumprod(1+r)) - 1)
+        return ann_ret, ann_vol, sharpe, max_dd
+
+    def apply_transaction_costs(self, weights_hist, cost=0.001):
+        turnover = np.sum(np.abs(np.diff(weights_hist, axis=0)), axis=1)
+        tc = cost * turnover
+        return tc
+
+    def detect_regime(self, vol_window=63):
+        rolling_vol = self.returns.std(axis=1).rolling(vol_window).mean()
+        threshold = rolling_vol.median()
+        return (rolling_vol > threshold).astype(int)
+
+def build_index(self, base=100):
+    cum = np.cumprod(1 + self.bt_returns)
+    return base * cum
+
+
