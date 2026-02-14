@@ -1,13 +1,12 @@
-# PortfolioOptimizerV2.py
+# portfolio_optimizer_v2_enhanced.py
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from scipy.optimize import minimize
+from scipy.optimize import minimize, linprog
 import matplotlib.pyplot as plt
-from datetime import datetime
 import warnings
 from pandas_datareader import data as pdr
-
+from sklearn.covariance import LedoitWolf
 
 class PortfolioOptimizerV2:
     def __init__(self, tickers,
@@ -16,13 +15,6 @@ class PortfolioOptimizerV2:
                  freq='1d',
                  risk_free_rate=0.02,
                  inflation=0.02):
-        """
-        tickers : list of equity/ETF tickers (strings)
-        start_date / end_date: for history fetch
-        freq: '1d' or '1wk' or '1mo'
-        risk_free_rate: annual nominal (e.g., 0.02 = 2%)
-        inflation: annual inflation to optionally deflate returns (default 2%)
-        """
         self.tickers = list(tickers)
         self.start_date = start_date
         self.end_date = end_date
@@ -30,32 +22,23 @@ class PortfolioOptimizerV2:
         self.risk_free_rate = risk_free_rate
         self.inflation = inflation
 
-        # Data containers
-        self.raw_prices = None       # as fetched (aligned)
-        self.prices = None           # possibly proxy index prices
-        self.returns = None          # simple returns (periodic)
-        self.ann_arithmetic = None   # annualized arithmetic mean
-        self.ann_geometric = None    # annualized geometric mean (CAGR)
-        self.cov_matrix = None       # annualized covariance (sample or shrunk)
+        self.raw_prices = None
+        self.prices = None
+        self.returns = None
+        self.ann_arithmetic = None
+        self.ann_geometric = None
+        self.cov_matrix = None
         self.num_assets = len(self.tickers)
 
-    #
-    # --- Data fetch & alignment ---
-    #
+    # -----------------------
+    # Data fetch & helpers
+    # -----------------------
     def fetch_data(self, proxy_map=None, use_auto_adjust=True, verbose=True):
-        """
-        proxy_map: dict mapping original ETF tickers -> proxy ticker (index or long-history ETF),
-                   e.g. {'IWDA.AS':'^990100-USD-STRD', 'VAGF.DE':'GLAB.L', 'IGLN.L':'GC=F'}
-        If proxy_map is None then fetch the tickers provided.
-        The code will try to fetch the proxy; if it fails, fetch the original ticker.
-        """
         tickers_to_fetch = []
-        self.fetch_map = {}  # maps original -> fetched ticker
-
+        self.fetch_map = {}
         for t in self.tickers:
             if proxy_map and t in proxy_map:
                 proxy = proxy_map[t]
-                # Try to fetch proxy quickly; if it fails fall back to original
                 try:
                     _ = yf.Ticker(proxy).history(start=self.start_date, end=self.end_date, auto_adjust=use_auto_adjust)
                     tickers_to_fetch.append(proxy)
@@ -68,7 +51,6 @@ class PortfolioOptimizerV2:
                 tickers_to_fetch.append(t)
                 self.fetch_map[t] = t
 
-        # download combined (this aligns calendars automatically)
         data = yf.download(tickers=list(set(tickers_to_fetch)),
                            start=self.start_date,
                            end=self.end_date,
@@ -76,37 +58,29 @@ class PortfolioOptimizerV2:
                            auto_adjust=use_auto_adjust,
                            progress=False)
 
-        # yfinance returns multiindex for multiple tickers; focus on 'Close' or adjusted
         if 'Close' in data:
             price_df = data['Close'].copy()
         else:
-            # single ticker case: data itself is the series
             price_df = data.copy()
 
-        # Ensure we have columns for each requested fetched ticker
         missing = [tk for tk in tickers_to_fetch if tk not in price_df.columns]
         if missing:
             warnings.warn(f"Missing columns after download: {missing}")
 
-        # Reindex and forward-fill small gaps then drop rows w/ all NaNs
         price_df = price_df.sort_index().ffill().dropna(how='all')
 
-        # Build final prices DataFrame matching order of original tickers
         final = pd.DataFrame(index=price_df.index)
         for orig in self.tickers:
             fetched = self.fetch_map[orig]
             if fetched in price_df.columns:
                 final[orig] = price_df[fetched]
             else:
-                # missing -> create NaN column (will be dropped later)
                 final[orig] = np.nan
 
-        # Drop columns that are entirely NaN and warn
         na_cols = final.columns[final.isna().all()].tolist()
         if na_cols:
             warnings.warn(f"No price data for: {na_cols}. They will be dropped.")
             final = final.drop(columns=na_cols)
-            # adjust tickers list
             self.tickers = [t for t in self.tickers if t not in na_cols]
             self.num_assets = len(self.tickers)
 
@@ -115,10 +89,8 @@ class PortfolioOptimizerV2:
             print(f"Fetched data for: {self.fetch_map}")
             print(f"Price history from {self.prices.index[0].date()} to {self.prices.index[-1].date()}")
 
-        # compute returns
         self.returns = self.prices.pct_change().dropna()
 
-        # set default annualization factor depending on freq
         if self.freq == '1d':
             self._ann_fac = 252
         elif self.freq == '1wk':
@@ -128,102 +100,54 @@ class PortfolioOptimizerV2:
         else:
             self._ann_fac = 252
 
-        # compute stats
         self._compute_stats()
 
-
-    def fetch_fred_series(
-        self,
-        series_id,
-        start="1900-01-01",
-        freq="M",
-        transform="pct",     # "pct", "log", or None
-        annualize=False
-    ):
-        """
-        Generic FRED series loader.
-    
-        series_id : str
-            FRED code, e.g. "DGS10"
-        freq : str
-            'M' (monthly), 'Q', 'A', 'D'
-        transform : str
-            "pct" = pct_change,
-            "log" = log returns,
-            None = raw levels
-        annualize : bool
-            Multiply returns by 12/4/252 depending on freq
-        """
-        s = pdr.DataReader(series_id, "fred", start=start)
-        s = s.dropna()
-    
-        # resample
+    def fetch_fred_series(self, series_id, start="1900-01-01", freq="M", transform="pct", annualize=False):
+        s = pdr.DataReader(series_id, "fred", start=start).dropna()
         if freq is not None:
             s = s.resample(freq).last()
-    
-        # transform to returns
         if transform == "pct":
             s = s.pct_change()
         elif transform == "log":
             s = np.log(s).diff()
-    
         s = s.dropna()
         s.columns = [series_id]
-    
         if annualize:
             fac = {"M": 12, "Q": 4, "A": 1, "D": 252}.get(freq, 1)
             s = s * fac
-    
         return s
-    
 
-    #
-    # --- Returns & covariance calculations ---
-    #
-
-
+    # -----------------------
+    # Pairwise means & cov
+    # -----------------------
     def pairwise_geometric_means(self):
-        """
-        Compute per-asset geometric (CAGR) returns using
-        all available data for each asset individually.
-        """
         mu = {}
         for c in self.returns.columns:
             r = self.returns[c].dropna()
-            if len(r) < 60:
+            if len(r) < 2:
                 mu[c] = np.nan
             else:
-                mu[c] = (1 + r).prod()**(self._ann_fac / len(r)) - 1
-    
+                mu[c] = (1 + r).prod() ** (self._ann_fac / len(r)) - 1
         self.ann_geometric = pd.Series(mu)
         return self.ann_geometric
 
-
-
     def nearest_positive_definite(self, A):
-        """
-        Higham's algorithm to find nearest positive-definite matrix.
-        Returns a symmetric positive-definite matrix.
-        """
-        # from https://stackoverflow.com/a/63131250 (adapted)
         B = (A + A.T) / 2
         _, s, V = np.linalg.svd(B)
         H = V.T @ np.diag(s) @ V
         A2 = (B + H) / 2
         A3 = (A2 + A2.T) / 2
-    
-        # ensure PD: tweak by adding small jitter until eigenvalues > 0
+
         def is_pd(X):
             try:
                 _ = np.linalg.cholesky(X)
                 return True
             except np.linalg.LinAlgError:
                 return False
-    
+
         if is_pd(A3):
             return A3
-    
-        # add jitter
+
         n = A.shape[0]
         spacing = np.spacing(np.linalg.norm(A))
         I = np.eye(n)
@@ -237,306 +161,91 @@ class PortfolioOptimizerV2:
                 raise RuntimeError("Failed to make matrix positive definite")
         return A3
 
-
-    def pairwise_covariance(self, min_obs=30, fill_method='single_factor'):
-        """
-        Build a covariance matrix using pairwise overlapping data.
-        - min_obs: only use pair if overlap >= 1 (we keep small overlaps); default 30 is conservative.
-        - fill_method: 'single_factor' (use avg correlation), 'diagonal' (zero off-diags),
-                       or 'zero' (set missing to 0), or 'average_corr' (fill with average corr).
-        This function:
-          1) computes pairwise covariances on all overlaps (no hard dropping unless zero overlap)
-          2) fills any remaining NaNs with a prior
-          3) enforces symmetry and positive-definiteness
-        """
+    def pairwise_covariance(self, min_obs=1, fill_method='single_factor'):
         assets = list(self.returns.columns)
         N = len(assets)
         cov = pd.DataFrame(np.nan, index=assets, columns=assets, dtype=float)
-        counts = pd.DataFrame(0, index=assets, columns=assets, dtype=int)
-    
-        # 1) compute pairwise covariances using available overlaps
+
         for i_idx, i in enumerate(assets):
             for j_idx, j in enumerate(assets):
                 if j_idx < i_idx:
-                    cov.loc[i, j] = cov.loc[j, i]  # reuse
-                    counts.loc[i, j] = counts.loc[j, i]
+                    cov.loc[i, j] = cov.loc[j, i]
                     continue
                 pair = self.returns[[i, j]].dropna()
                 n = len(pair)
-                counts.loc[i, j] = n
-                counts.loc[j, i] = n
-                if n >= 1:
-                    # use sample covariance (unbiased); if n==1 covariance is 0
-                    if n == 1:
-                        cov_val = 0.0
-                    else:
-                        cov_val = np.cov(pair[i], pair[j], ddof=1)[0, 1]
+                if n >= min_obs:
+                    cov_val = 0.0 if n == 1 else np.cov(pair[i], pair[j], ddof=1)[0, 1]
                     cov.loc[i, j] = cov_val
                     cov.loc[j, i] = cov_val
                 else:
                     cov.loc[i, j] = np.nan
                     cov.loc[j, i] = np.nan
-    
-        # 2) scale to annual
+
         cov = cov * self._ann_fac
-    
-        # 3) fill NaNs with a prior depending on fill_method
-        nan_mask = cov.isna()
-        if nan_mask.values.any():
-            # compute per-asset variances from available diagonal entries (if diagonal missing, fallback to global var)
+
+        if cov.isna().values.any():
             diag = np.diag(cov.fillna(0).values)
             var_vec = pd.Series(diag, index=assets)
-            # If some diagonal are zero (or NaN), replace with sample var from returns
             for a in assets:
                 if var_vec[a] == 0 or np.isnan(var_vec[a]):
                     s = self.returns[a].dropna()
-                    if len(s) > 1:
-                        var_vec[a] = s.var(ddof=1) * self._ann_fac
-                    else:
-                        var_vec[a] = 1e-8  # tiny fallback
-    
-            if fill_method == 'diagonal' or fill_method == 'zero':
-                # zero off-diagonals => prior covariance = 0 (uncorrelated)
+                    var_vec[a] = s.var(ddof=1) * self._ann_fac if len(s) > 1 else 1e-8
+
+            if fill_method in ('diagonal', 'zero'):
                 for i in assets:
                     for j in assets:
                         if pd.isna(cov.loc[i, j]):
-                            if i == j:
-                                cov.loc[i, j] = var_vec[i]
-                            else:
-                                cov.loc[i, j] = 0.0
+                            cov.loc[i, j] = var_vec[i] if i == j else 0.0
             else:
-                # build single-factor / average-correlation prior
-                # estimate average correlation from available pairs
                 cors = []
                 for i in assets:
                     for j in assets:
-                        if i == j: 
+                        if i == j:
                             continue
                         if not pd.isna(cov.loc[i, j]):
                             denom = np.sqrt(var_vec[i] * var_vec[j])
                             if denom > 0:
                                 cors.append(cov.loc[i, j] / denom)
-                if len(cors) == 0:
-                    rho_bar = 0.0
-                else:
-                    rho_bar = np.nanmean(cors)
-    
-                # fill missing using rho_bar * sigma_i * sigma_j
+                rho_bar = np.nanmean(cors) if len(cors) > 0 else 0.0
                 sigma = np.sqrt(var_vec)
                 for i in assets:
                     for j in assets:
                         if pd.isna(cov.loc[i, j]):
                             cov.loc[i, j] = rho_bar * sigma[i] * sigma[j]
-    
-        # 4) ensure symmetry
+
         cov = (cov + cov.T) / 2
-    
-        # 5) enforce positive-definite (nearest PD)
-        cov_mat = cov.values
         try:
-            # If already PD, leave it
-            _ = np.linalg.cholesky(cov_mat)
-            pd_cov = cov_mat
+            _ = np.linalg.cholesky(cov.values)
+            cov_pd = cov.values
         except np.linalg.LinAlgError:
-            pd_cov = self.nearest_positive_definite(cov_mat)
-    
-        cov_pd = pd.DataFrame(pd_cov, index=assets, columns=assets)
-        self.cov_matrix = cov_pd
+            cov_pd = self.nearest_positive_definite(cov.values)
+
+        self.cov_matrix = pd.DataFrame(cov_pd, index=assets, columns=assets)
         return self.cov_matrix
-    
 
-    
-
-    
+    # -----------------------
+    # Compute stats
+    # -----------------------
     def _compute_stats(self):
-        """
-        Compute arithmetic and geometric annualized returns and annualized cov matrix.
-        """
         if self.returns is None or self.returns.shape[0] == 0:
             raise RuntimeError("No returns available. Call fetch_data() first.")
 
-        # Arithmetic mean (periodic) -> annual arithmetic
         mean_periodic = self.returns.mean(axis=0)
         self.ann_arithmetic = mean_periodic * self._ann_fac
 
-        # Geometric mean (CAGR) per asset
-        # (1 + r1)*(1 + r2)*...^(fac / n_periods) - 1
         n_periods = self.returns.shape[0]
         geo = (1 + self.returns).prod(axis=0) ** (self._ann_fac / n_periods) - 1
-        #self.ann_geometric = geo
 
-        # Default cov (sample) annualized
-        #self.cov_matrix = self.returns.cov() * self._ann_fac
-
-        # Use pairwise estimators instead of common-window
         self.pairwise_geometric_means()
-        self.pairwise_covariance(min_obs=30, fill_method='single_factor')
-        
-        # Safety: if any ann_geometric is NaN (too little data), fallback to arithmetic or a prior
+        self.pairwise_covariance(min_obs=1, fill_method='single_factor')
+
         if self.ann_geometric.isna().any():
-            # replace NaN entries with ann_arithmetic or small prior
             for idx in self.ann_geometric.index[self.ann_geometric.isna()]:
                 if not pd.isna(self.ann_arithmetic.get(idx, np.nan)):
                     self.ann_geometric.loc[idx] = self.ann_arithmetic.loc[idx]
                 else:
-                    self.ann_geometric.loc[idx] = 0.03  # conservative fallback
+                    self.ann_geometric.loc[idx] = 0.03
 
-
-
-    def get_expected_returns(self, method='geometric', deflate_inflation=True):
-        """
-        Return a vector of expected returns (annualized). Options:
-         - method: 'geometric' or 'arithmetic'
-         - deflate_inflation: if True, subtract inflation (so returns are real)
-        """
-        if method == 'geometric':
-            mu = self.ann_geometric.copy()
-        else:
-            mu = self.ann_arithmetic.copy()
-
-        if deflate_inflation and (self.inflation is not None):
-            mu = mu - self.inflation
-
-        return mu
-
-    def shrink_means(self, prior=None, lam=0.5):
-        """
-        Shrink sample means toward prior (vector same length).
-        lam in [0,1] where lam=1 => full prior, lam=0 => sample.
-        If prior is None use simple economic priors:
-            equities ~ 6.5%, bonds ~ 2.5%, gold ~ 2.5%
-        The user should pass prior as numpy array ordered like self.tickers.
-        """
-        sample_mu = self.get_expected_returns(method='geometric', deflate_inflation=False)
-        if prior is None:
-            # default flat prior equal to the sample mean mean
-            avg = sample_mu.mean()
-            prior_vec = np.repeat(avg, len(sample_mu))
-        else:
-            prior_vec = np.array(prior)
-            if prior_vec.shape[0] != sample_mu.shape[0]:
-                raise ValueError("Prior length mismatch with assets.")
-
-        shrunk = lam * prior_vec + (1 - lam) * sample_mu.values
-        self.ann_geometric = pd.Series(shrunk, index=sample_mu.index)
-        return self.ann_geometric
-
-    def shrink_covariance(self, delta=0.1, prior_type='diagonal'):
-        """
-        Simple shrinkage: cov_shrunk = delta * prior + (1-delta) * sample_cov
-        prior_type: 'diagonal' (prior = diag(sample variances)), 'single_factor' (constant correlation)
-        delta: shrinkage intensity 0..1
-        """
-        S = self.cov_matrix.values
-        N = S.shape[0]
-
-        if prior_type == 'diagonal':
-            prior = np.diag(np.diag(S))
-        elif prior_type == 'single_factor':
-            # constant correlation prior: sigma_i * sigma_j * rho_bar
-            var = np.diag(S)
-            sigma = np.sqrt(var)
-            # compute average off-diagonal correlation
-            corr = np.zeros((N, N))
-            for i in range(N):
-                for j in range(N):
-                    corr[i, j] = S[i, j] / (sigma[i] * sigma[j]) if sigma[i]*sigma[j] > 0 else 0
-            rho_bar = (np.sum(corr) - N) / (N*(N-1))
-            prior = np.outer(sigma, sigma) * rho_bar
-            np.fill_diagonal(prior, var)
-        else:
-            raise ValueError("Unknown prior_type")
-
-        shrunk = delta * prior + (1 - delta) * S
-        self.cov_matrix = pd.DataFrame(shrunk, index=self.cov_matrix.index, columns=self.cov_matrix.columns)
-        return self.cov_matrix
-
-    def ewma_cov(self, halflife=63):
-        """
-        Compute EWMA covariance with given halflife (in periods).
-        """
-        lambda_ = 0.5 ** (1 / halflife)  # conversion to decay factor per period
-        returns_centered = self.returns - self.returns.mean()
-        S = returns_centered.T @ (returns_centered * 0)  # placeholder
-        # compute exponentially weighted covariance
-        cov = returns_centered.ewm(halflife=halflife).cov(pairwise=True)
-        # pandas ewm.cov returns MultiIndex; build sample covariance at last date
-        last_date = returns_centered.index[-1]
-        cov_last = cov.loc[last_date]
-        # fill missing diagonal if needed
-        self.cov_matrix = cov_last * self._ann_fac
-        return self.cov_matrix
-
-    #
-    # --- Portfolio functions & optimizers (Sharpe, target return, target vol) ---
-    #
-    def portfolio_performance(self, weights, use_mu='geometric'):
-        w = np.array(weights)
-        if use_mu == 'geometric':
-            mu = self.ann_geometric.values
-        else:
-            mu = self.ann_arithmetic.values
-        ret = float(np.dot(w, mu))
-        vol = float(np.sqrt(w.T @ self.cov_matrix.values @ w))
-        sharpe = (ret - self.risk_free_rate) / vol if vol > 0 else np.nan
-        return ret, vol, sharpe
-
-    def negative_sharpe(self, weights):
-        return -self.portfolio_performance(weights)[2]
-
-    def check_sum(self, weights):
-        return np.sum(weights) - 1.0
-
-    def optimize_sharpe(self, bounds=None, constraints=None):
-        if bounds is None:
-            bounds = [(0, 1) for _ in range(self.num_assets)]
-        if constraints is None:
-            constraints = ({'type': 'eq', 'fun': self.check_sum},)
-
-        init_guess = np.ones(self.num_assets) / self.num_assets
-        result = minimize(self.negative_sharpe, init_guess, method='SLSQP', bounds=bounds, constraints=constraints)
-        if not result.success:
-            warnings.warn("Optimization did not converge: " + str(result.message))
-        w = result.x
-        perf = self.portfolio_performance(w)
-        self.max_sharpe_weights = w
-        self.max_sharpe_perf = perf
-        return w, perf
-
-    def optimize_for_return(self, target_return, bounds=None):
-        if bounds is None:
-            bounds = [(0, 1) for _ in range(self.num_assets)]
-
-        # feasibility check
-        ub = np.array([b[1] for b in bounds])
-        lb = np.array([b[0] for b in bounds])
-        max_ret = float(np.dot(ub, self.ann_geometric.values))
-        min_ret = float(np.dot(lb, self.ann_geometric.values))
-        if not (min_ret - 1e-12 <= target_return <= max_ret + 1e-12):
-            raise ValueError(f"Target return {target_return:.4f} infeasible ({min_ret:.4f} .. {max_ret:.4f}).")
-
-        constraints = [
-            {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0},
-            {'type': 'eq', 'fun': lambda w: np.dot(w, self.ann_geometric.values) - target_return}
-        ]
-        init = np.ones(self.num_assets) / self.num_assets
-        res = minimize(lambda w: np.sqrt(w.T @ self.cov_matrix.values @ w),
-                       init, method='SLSQP', bounds=bounds, constraints=constraints)
-        if not res.success:
-            warnings.warn("Target-return optimization failed: " + str(res.message))
-        return res.x, self.portfolio_performance(res.x)
-
-    def optimize_for_volatility(self, target_vol, bounds=None):
-        if bounds is None:
-            bounds = [(0, 1) for _ in range(self.num_assets)]
-        constraints = [{'type': 'eq', 'fun': self.check_sum},
-                       {'type': 'eq', 'fun': lambda w: np.sqrt(w.T @ self.cov_matrix.values @ w) - target_vol}]
-        init = np.ones(self.num_assets) / self.num_assets
-        res = minimize(lambda w: -np.dot(w, self.ann_geometric.values),
-                       init, method='SLSQP', bounds=bounds, constraints=constraints)
-        if not res.success:
-            warnings.warn("Target-vol optimization failed: " + str(res.message))
-        return res.x, self.portfolio_performance(res.x)
 
     #
     # --- Efficient frontier simulation & plotting ---
@@ -573,15 +282,281 @@ class PortfolioOptimizerV2:
         plt.title('Efficient Frontier (simulated)')
         plt.legend()
         plt.show()
+    
+    
+    # -----------------------
+    # Data-driven mean shrinkage (empirical Bayes / James-Stein-ish)
+    # -----------------------
+    def shrink_means_empirical(self, prior=None, lam=None):
+        """
+        Empirical shrinkage of means toward cross-sectional mean (data-driven lambda).
+        If lam is None, compute lambda from sampling variance vs between-asset variance.
+        """
+        sample_mu = self.get_expected_returns(method='geometric', deflate_inflation=False)
+        # sample variances of the sample mean: var(r)/n_i * ann_fac^2? Approx with var(r)*ann_fac / n
+        n_obs = {c: self.returns[c].dropna().shape[0] for c in self.returns.columns}
+        sample_var = self.returns.var(ddof=1)
+        # variance of mean estimator (annualized)
+        var_mean_est = pd.Series({c: (sample_var[c] / max(1, n_obs[c])) * self._ann_fac for c in self.returns.columns})
 
-    #
-    # --- Rolling backtest (walk-forward) ---
-    #
+        avg_sampling_var = var_mean_est.mean()
+        between_var = sample_mu.var(ddof=1)
 
+        if lam is None:
+            # lambda = sampling_var / (between_var + sampling_var) clipped to [0,1]
+            denom = between_var + avg_sampling_var
+            lam_hat = float(avg_sampling_var / denom) if denom > 0 else 1.0
+            lam_hat = float(np.clip(lam_hat, 0.0, 1.0))
+        else:
+            lam_hat = float(np.clip(lam, 0.0, 1.0))
+
+        if prior is None:
+            prior_vec = np.repeat(sample_mu.mean(), len(sample_mu))
+        else:
+            prior_vec = np.array(prior)
+            if prior_vec.shape[0] != len(sample_mu):
+                raise ValueError("Prior length mismatch with assets.")
+
+        shrunk = lam_hat * prior_vec + (1 - lam_hat) * sample_mu.values
+        self.ann_geometric = pd.Series(shrunk, index=sample_mu.index)
+        return self.ann_geometric
+
+    # -----------------------
+    # Covariance shrinkage options
+    # -----------------------
+
+    def shrink_covariance_ledoit_wolf(self):
+        """
+        Shrink sample covariance toward Ledoit-Wolf estimator.
+        Requires scikit-learn (already installed).
+        """
+        if self.returns is None or self.returns.shape[0] == 0:
+            raise RuntimeError("No returns available. Call fetch_data() first.")
+
+        lw = LedoitWolf()
+        lw.fit(self.returns.values)
+        cov_shrunk = lw.covariance_ * self._ann_fac  # annualize
+        self.cov_matrix = pd.DataFrame(cov_shrunk, index=self.returns.columns, columns=self.returns.columns)
+        return self.cov_matrix
+
+    def shrink_covariance(self, delta=0.1, prior_type='single_factor'):
+        """
+        Backwards-compatible simple shrink. New recommended option is shrink_covariance_ledoit_wolf().
+        """
+        if prior_type == 'ledoit_wolf':
+            return self.shrink_covariance_ledoit_wolf()
+
+        S = self.cov_matrix.values
+        N = S.shape[0]
+
+        if prior_type == 'diagonal':
+            prior = np.diag(np.diag(S))
+        elif prior_type == 'single_factor':
+            var = np.diag(S)
+            sigma = np.sqrt(var)
+            corr = np.zeros((N, N))
+            for i in range(N):
+                for j in range(N):
+                    corr[i, j] = S[i, j] / (sigma[i] * sigma[j]) if sigma[i] * sigma[j] > 0 else 0
+            rho_bar = (np.sum(corr) - N) / (N * (N - 1)) if N > 1 else 0.0
+            prior = np.outer(sigma, sigma) * rho_bar
+            np.fill_diagonal(prior, var)
+        else:
+            raise ValueError("Unknown prior_type")
+
+        shrunk = delta * prior + (1 - delta) * S
+        self.cov_matrix = pd.DataFrame(shrunk, index=self.cov_matrix.index, columns=self.cov_matrix.columns)
+        return self.cov_matrix
+
+    # -----------------------
+    # EWMA covariance (fast)
+    # -----------------------
+    def ewma_cov(self, halflife=63):
+        lam = 0.5 ** (1 / halflife)
+        returns_centered = self.returns - self.returns.mean()
+        S = returns_centered.cov().values  # init
+        for t in range(returns_centered.shape[0]):
+            r = returns_centered.iloc[t].values.reshape(-1, 1)
+            S = lam * S + (1 - lam) * (r @ r.T)
+        self.cov_matrix = pd.DataFrame(S * self._ann_fac, index=self.returns.columns, columns=self.returns.columns)
+        return self.cov_matrix
+
+    # -----------------------
+    # Portfolio metrics & classical optimizers
+    # -----------------------
+    def get_expected_returns(self, method='geometric', deflate_inflation=True):
+        if method == 'geometric':
+            mu = self.ann_geometric.copy()
+        else:
+            mu = self.ann_arithmetic.copy()
+
+        if deflate_inflation and (self.inflation is not None):
+            mu = mu - self.inflation
+        return mu
+
+    def portfolio_performance(self, weights, use_mu='geometric'):
+        w = np.array(weights)
+        mu = self.get_expected_returns(method=(use_mu or 'geometric'), deflate_inflation=False).values
+        ret = float(np.dot(w, mu))
+        vol = float(np.sqrt(w.T @ self.cov_matrix.values @ w))
+        sharpe = (ret - self.risk_free_rate) / vol if vol > 0 else np.nan
+        return ret, vol, sharpe
+
+    def negative_sharpe(self, weights):
+        return -self.portfolio_performance(weights)[2]
+
+    def check_sum(self, weights):
+        return np.sum(weights) - 1.0
+
+    def optimize_sharpe(self, bounds=None, constraints=None):
+        if bounds is None:
+            bounds = [(0, 1)] * self.num_assets
+        if constraints is None:
+            constraints = ({'type': 'eq', 'fun': self.check_sum},)
+        init_guess = np.ones(self.num_assets) / self.num_assets
+        result = minimize(self.negative_sharpe, init_guess, method='SLSQP', bounds=bounds, constraints=constraints)
+        if not result.success:
+            warnings.warn("Optimization did not converge: " + str(result.message))
+        w = result.x
+        perf = self.portfolio_performance(w)
+        self.max_sharpe_weights = w
+        self.max_sharpe_perf = perf
+        return w, perf
+
+    def minimize_variance(self, bounds=None):
+        if bounds is None:
+            bounds = [(0, 1)] * self.num_assets
+        cons = ({'type': 'eq', 'fun': self.check_sum},)
+        init = np.ones(self.num_assets) / self.num_assets
+        res = minimize(lambda w: np.sqrt(w.T @ self.cov_matrix.values @ w),
+                       init, method='SLSQP', bounds=bounds, constraints=cons)
+        if not res.success:
+            warnings.warn("Min-variance optimization failed: " + str(res.message))
+        return res.x, self.portfolio_performance(res.x)
+
+    # -----------------------
+    # Risk-parity (equal risk contribution)
+    # -----------------------
+    def optimize_risk_parity(self, bounds=None):
+        if bounds is None:
+            bounds = [(0, 1)] * self.num_assets
+
+        def rc_obj(w):
+            w = np.array(w)
+            cov = self.cov_matrix.values
+            total_portfolio_vol = np.sqrt(w.T @ cov @ w)
+            # marginal contributions
+            mrc = cov @ w
+            rc = w * mrc
+            # desired: equal contributions
+            target = total_portfolio_vol * w.sum() / len(w)
+            # measure squared deviations normalized
+            return np.sum((rc - (total_portfolio_vol / len(w)))**2)
+
+        cons = ({'type': 'eq', 'fun': self.check_sum},)
+        init = np.ones(self.num_assets) / self.num_assets
+        res = minimize(rc_obj, init, method='SLSQP', bounds=bounds, constraints=cons, options={'maxiter': 500})
+        if not res.success:
+            warnings.warn("Risk-parity optimization failed: " + str(res.message))
+        return res.x, self.portfolio_performance(res.x)
+
+    # -----------------------
+    # Sharpe with turnover penalty (transaction cost control)
+    # -----------------------
+    def optimize_sharpe_with_turnover(self, prev_weights=None, gamma=1e-3, bounds=None):
+        if bounds is None:
+            bounds = [(0, 1)] * self.num_assets
+        if prev_weights is None:
+            prev_weights = np.zeros(self.num_assets)
+
+        def obj(w):
+            w = np.clip(w, [b[0] for b in bounds], [b[1] for b in bounds])
+            r, v, _ = self.portfolio_performance(w)
+            if v <= 0 or not np.isfinite(v):
+                return 1e6
+            sharpe = (r - self.risk_free_rate) / v
+            turnover = np.sum(np.abs(w - prev_weights))
+            return -sharpe + gamma * turnover
+
+        cons = ({'type': 'eq', 'fun': self.check_sum},)
+        init = np.ones(self.num_assets) / self.num_assets
+        res = minimize(obj, init, method='SLSQP', bounds=bounds, constraints=cons)
+        if not res.success:
+            warnings.warn("Optimize Sharpe with turnover failed: " + str(res.message))
+        return res.x, self.portfolio_performance(res.x)
+
+    # -----------------------
+    # CVaR optimization (linear program)
+    # -----------------------
+    def optimize_cvar(self, alpha=0.95, bounds=None, target_return=None, solver='highs'):
+        """
+        Minimize CVaR_alpha of portfolio returns subject to weight bounds and optional target_return.
+        Implementation uses linear programming formulation (Rockafellar & Uryasev).
+        """
+        if bounds is None:
+            bounds = [(0, 1)] * self.num_assets
+
+        R = self.returns.dropna().values  # T x N
+        T, N = R.shape
+
+        # Decision vars: w (N), eta (1), z (T)
+        num_vars = N + 1 + T
+        c = np.zeros(num_vars)
+        c[N] = 1.0
+        c[N + 1:] = 1.0 / ((1 - alpha) * T)
+
+        A_ub = []
+        b_ub = []
+
+        # constraints: z_i >= -w^T r_i - eta  --> -w^T r_i - eta - z_i <= 0
+        for t in range(T):
+            row = np.zeros(num_vars)
+            row[:N] = -R[t]
+            row[N] = -1.0
+            row[N + 1 + t] = -1.0
+            A_ub.append(row)
+            b_ub.append(0.0)
+
+        # z_i >= 0  --> -z_i <= 0
+        for t in range(T):
+            row = np.zeros(num_vars)
+            row[N + 1 + t] = -1.0
+            A_ub.append(row)
+            b_ub.append(0.0)
+
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+
+        # Equality: sum(w) = 1
+        A_eq = np.zeros((1, num_vars))
+        A_eq[0, :N] = 1.0
+        b_eq = np.array([1.0])
+
+        # Optional target return constraint
+        if target_return is not None:
+            row = np.zeros(num_vars)
+            # Note: using geometric or arithmetic? use ann_arithmetic for linear constraint
+            row[:N] = self.ann_arithmetic.values
+            A_eq = np.vstack([A_eq, row])
+            b_eq = np.append(b_eq, target_return)
+
+        # variable bounds
+        var_bounds = list(bounds) + [(None, None)] + [(0, None)] * T
+
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=var_bounds, method=solver)
+        if not res.success:
+            warnings.warn("CVaR optimization failed: " + str(res.message))
+        w = res.x[:N]
+        perf = self.portfolio_performance(w)
+        return w, perf, res
+
+    # -----------------------
+    # Rolling backtest (walk forward)
+    # -----------------------
     def rolling_backtest(self, window=252, rebalance_freq=21,
                          method='sharpe', bounds=None,
-                         shrink_mean=None, shrink_cov=None):
-    
+                         shrink_mean=None, shrink_cov=None,
+                         gamma=1e-3):
         if bounds is None:
             bounds = [(0, 1)] * self.num_assets
     
@@ -593,77 +568,74 @@ class PortfolioOptimizerV2:
         portfolio_returns = []
         weights_hist = []
     
-        for i in range(0, len(returns) - window, rebalance_freq):
+        # start from equal weights
+        prev_weights = np.ones(self.num_assets) / self.num_assets
     
+        for i in range(0, len(returns) - window, rebalance_freq):
             train = returns.iloc[i:i + window]
             test = returns.iloc[i + window:i + window + rebalance_freq]
     
-            # backup full-sample state
             old_returns = self.returns
             old_mu = self.ann_geometric.copy()
             old_cov = self.cov_matrix.copy()
     
-            # fit on training window
             self.returns = train
             self._compute_stats()
     
-            # --------- DATA-DRIVEN SHRINKAGE ----------
+            # mean shrink
             if shrink_mean is not None:
-                lam = shrink_mean.get("lam", 0.5)
+                lam = shrink_mean.get("lam", None)
+                prior = shrink_mean.get("prior", None)
+                self.shrink_means_empirical(prior=prior, lam=lam)
     
-                if shrink_mean.get("prior") is None:
-                    # empirical Bayes prior: cross-sectional mean
-                    prior = np.repeat(self.ann_geometric.mean(), self.num_assets)
-                else:
-                    prior = shrink_mean["prior"]
-    
-                self.shrink_means(prior=prior, lam=lam)
-    
+            # covariance shrink
             if shrink_cov is not None:
-                delta = shrink_cov.get("delta", 0.1)
-                ptype = shrink_cov.get("prior_type", "single_factor")
-                self.shrink_covariance(delta=delta, prior_type=ptype)
+                if shrink_cov.get("method", "") == "ledoit_wolf":
+                    self.shrink_covariance_ledoit_wolf()
+                else:
+                    delta = shrink_cov.get("delta", 0.1)
+                    ptype = shrink_cov.get("prior_type", "single_factor")
+                    self.shrink_covariance(delta=delta, prior_type=ptype)
             else:
                 self.cov_matrix = train.cov() * self._ann_fac
     
-            # -------- SAFE SHARPE OPTIMIZER ----------
-            def safe_negative_sharpe(w):
-                # clip inside bounds
-                for k, (lo, hi) in enumerate(bounds):
-                    w[k] = np.clip(w[k], lo, hi)
+            # -----------------------
+            # choose optimization
+            # -----------------------
+            if method == 'sharpe':
+                w, perf = self.optimize_sharpe(bounds=bounds)
     
-                if abs(w.sum() - 1) > 1e-6:
-                    return 1e6
+            elif method == 'sharpe_tc':   # <<< NEW
+                w, perf = self.optimize_sharpe_with_turnover(
+                    prev_weights=prev_weights,
+                    gamma=gamma,
+                    bounds=bounds
+                )
     
-                r, v, _ = self.portfolio_performance(w)
-                if not np.isfinite(v) or v <= 0:
-                    return 1e6
+            elif method == 'minvar':
+                w, perf = self.minimize_variance(bounds=bounds)
     
-                return -(r - self.risk_free_rate) / v
+            elif method == 'risk_parity':
+                w, perf = self.optimize_risk_parity(bounds=bounds)
     
-            cons = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1},)
-            init = np.ones(self.num_assets) / self.num_assets
+            elif method == 'cvar':
+                w, perf, _ = self.optimize_cvar(
+                    alpha=shrink_cov.get('cvar_alpha', 0.95) if shrink_cov else 0.95,
+                    bounds=bounds,
+                    target_return=None
+                )
     
-            res = minimize(
-                safe_negative_sharpe,
-                init,
-                method="SLSQP",
-                bounds=bounds,
-                constraints=cons,
-                options={"ftol": 1e-9, "disp": False, "maxiter": 200}
-            )
+            else:
+                w, perf = self.optimize_sharpe(bounds=bounds)
     
-            if not res.success:
-                warnings.warn(f"Backtest optimizer failed at step {i}: {res.message}")
-    
-            w = res.x
-    
-            # apply to test window
+            # apply to test
             p_ret = test.values @ w
             portfolio_returns.append(p_ret)
             weights_hist.append(w)
     
-            # restore full-sample state
+            prev_weights = w.copy()
+    
+            # restore
             self.returns = old_returns
             self.ann_geometric = old_mu
             self.cov_matrix = old_cov
@@ -671,22 +643,19 @@ class PortfolioOptimizerV2:
         flat = np.concatenate(portfolio_returns)
         self.bt_returns = flat
         self.bt_weights = np.vstack(weights_hist)
-    
         return self.bt_returns, self.bt_weights
 
 
-
+    # -----------------------
+    # Backtest stats & helpers
+    # -----------------------
     def backtest_stats(self):
-        """
-        Return annualized return, vol, sharpe, max drawdown for bt_returns
-        """
         r = getattr(self, 'bt_returns', None)
         if r is None or len(r) == 0:
             raise ValueError("No backtest returns found. Run rolling_backtest first.")
         ann_ret = np.mean(r) * self._ann_fac
         ann_vol = np.std(r) * np.sqrt(self._ann_fac)
         sharpe = (ann_ret - self.risk_free_rate) / ann_vol if ann_vol > 0 else np.nan
-
         cum = np.cumprod(1 + r)
         peak = np.maximum.accumulate(cum)
         dd = (cum / peak - 1).min()
