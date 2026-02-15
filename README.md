@@ -32,6 +32,7 @@ See demo Jupyter notebook for use examples.
 
 ## Covariance & Mean Estimation
 
+- Nearest PSD cov matrix calculation and diagnostics
 - Pairwise covariance with positive-definite adjustment
 - Ledoit–Wolf shrinkage (scikit-learn)  
 - EWMA covariance with configurable halflife 
@@ -45,11 +46,6 @@ See demo Jupyter notebook for use examples.
 - `optimize_cvar` – minimize Conditional Value at Risk (CVaR) 
 - `optimize_sharpe_with_turnover` – penalize high turnover for transaction cost control
 
-## Rolling Backtest Method
-
-- `rolling_backtest(window, rebalance_freq, method, bounds, shrink_mean, shrink_cov, gamma)`  
-- Supports all optimization methods
-- Returns portfolio returns and weights history
 
 ## Outputs
 
