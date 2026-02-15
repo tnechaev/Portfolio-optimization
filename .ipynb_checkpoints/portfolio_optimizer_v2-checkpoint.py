@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import warnings
 from pandas_datareader import data as pdr
 from sklearn.covariance import LedoitWolf
+import traceback
 
 class PortfolioOptimizerV2:
     def __init__(self, tickers,
@@ -29,6 +30,7 @@ class PortfolioOptimizerV2:
         self.ann_geometric = None
         self.cov_matrix = None
         self.num_assets = len(self.tickers)
+
 
     # -----------------------
     # Data fetch & helpers
@@ -102,7 +104,7 @@ class PortfolioOptimizerV2:
 
         self._compute_stats()
 
-    def fetch_fred_series(self, series_id, start="1900-01-01", freq="M", transform="pct", annualize=False):
+    def fetch_fred_series(self, series_id, start="1900-01-01", freq="ME", transform="pct", annualize=False):
         s = pdr.DataReader(series_id, "fred", start=start).dropna()
         if freq is not None:
             s = s.resample(freq).last()
@@ -113,10 +115,305 @@ class PortfolioOptimizerV2:
         s = s.dropna()
         s.columns = [series_id]
         if annualize:
-            fac = {"M": 12, "Q": 4, "A": 1, "D": 252}.get(freq, 1)
+            fac = {"ME": 12, "Q": 4, "A": 1, "D": 252}.get(freq, 1)
             s = s * fac
         return s
 
+
+
+    
+    def build_factors(self, factor_map, freq="ME"):
+        """
+        Build factor returns DataFrame from a factor_map.
+        Supports FRED and Yahoo sources.
+    
+        factor_map example:
+        {
+            "growth": {"yahoo": "^990100-USD-STRD"},
+            "rates":  {"fred": "GS10", "transform": "diff"},
+            "infl":   {"fred": "CPIAUCSL", "transform": "pct"},
+            "gold":   {"yahoo": "IAU"}
+        }
+    
+        Returns: DataFrame indexed by date with factor columns (resampled to freq)
+        """
+        series = {}
+    
+        for name, cfg in factor_map.items():
+            try:
+                # ---------------- FRED ----------------
+                if "fred" in cfg:
+                    code = cfg["fred"]
+                    s = pdr.DataReader(code, "fred", self.start_date, self.end_date)
+                    # Convert to Series if DataFrame with 1 column
+                    if isinstance(s, pd.DataFrame) and s.shape[1] > 1:
+                        s = s.iloc[:, 0]
+                    s = s.copy()  # avoid side effects
+    
+                    # Safe renaming
+                    if isinstance(s, pd.Series):
+                        s.name = name
+                    elif isinstance(s, pd.DataFrame) and s.shape[1] == 1:
+                        s.columns = [name]
+                        s = s.iloc[:, 0]
+                    else:
+                        raise RuntimeError(f"Unexpected shape for factor '{name}': {s.shape}")
+    
+                    if freq is not None:
+                        s = s.resample(freq).last()
+                    transform = cfg.get("transform", "pct")
+                    if transform == "pct":
+                        s = s.pct_change(fill_method=None).dropna()
+                    elif transform == "log":
+                        s = np.log(s).diff().dropna()
+                    elif transform == "diff":
+                        s = s.diff().dropna()
+                    else:
+                        s = s.dropna()
+    
+                # ---------------- Yahoo ----------------
+                elif "yahoo" in cfg:
+                    ticker = cfg["yahoo"]
+                    df = yf.download(ticker, start=self.start_date, end=self.end_date, progress=False)
+                    if df.empty:
+                        raise RuntimeError(f"yfinance returned empty for {ticker}")
+    
+                    # Extract Adjusted Close (or Close fallback)
+                    if isinstance(df.columns, pd.MultiIndex):
+                        if "Adj Close" in df.columns.get_level_values(0):
+                            s = df["Adj Close"].copy()
+                        elif "Close" in df.columns.get_level_values(0):
+                            s = df["Close"].copy()
+                        else:
+                            s = df.iloc[:, 0]
+                    else:
+                        if "Adj Close" in df.columns:
+                            s = df["Adj Close"].copy()
+                        elif "Close" in df.columns:
+                            s = df["Close"].copy()
+                        else:
+                            s = df.iloc[:, 0]
+    
+                    s = s.copy()
+    
+                    # Safe renaming
+                    if isinstance(s, pd.Series):
+                        s.name = name
+                    elif isinstance(s, pd.DataFrame) and s.shape[1] == 1:
+                        s.columns = [name]
+                        s = s.iloc[:, 0]
+                    else:
+                        raise RuntimeError(f"Unexpected shape for factor '{name}': {s.shape}")
+    
+                    if freq is not None:
+                        s = s.resample(freq).last()
+                    transform = cfg.get("transform", "pct")
+                    if transform == "pct":
+                        s = s.pct_change(fill_method=None).dropna()
+                    elif transform == "log":
+                        s = np.log(s).diff().dropna()
+                    elif transform == "diff":
+                        s = s.diff().dropna()
+                    else:
+                        s = s.dropna()
+    
+                else:
+                    raise ValueError(f"No data source in factor config for '{name}'")
+    
+                series[name] = s
+    
+            except Exception as e:
+                warnings.warn(f"Could not build factor '{name}': {e}. Skipping this factor.")
+                continue
+    
+        if len(series) == 0:
+            raise RuntimeError("No factors could be loaded from factor_map.")
+    
+        # Concatenate all factor series into a DataFrame
+        factors = pd.concat(list(series.values()), axis=1)
+        factors.columns = list(series.keys())
+        factors = factors.dropna(how="all").dropna()
+        return factors
+
+
+
+    # -----------------------
+    # Factor covariance
+    # -----------------------
+    def factor_covariance(self, train_returns, factors):
+        from sklearn.linear_model import LinearRegression
+    
+        # Ensure symmetric indexing and try to align frequency:
+        # If no overlap, resample train_returns to factors' frequency using compound returns.
+        common = train_returns.index.intersection(factors.index)
+        if len(common) < max(3, factors.shape[1] * 3):  # heuristic: need some overlap
+            # resample train_returns to factor freq (fallback to month end)
+            try:
+                target_freq = factors.index.freq or pd.infer_freq(factors.index) or 'M'
+                # convert simple returns to period returns: (1+rt).prod() - 1
+                train_resampled = (1.0 + train_returns).resample(target_freq).apply(
+                    lambda x: (1.0 + x).prod() - 1
+                ).dropna(how='all')
+                common = train_resampled.index.intersection(factors.index)
+                if len(common) == 0:
+                    raise RuntimeError("No overlap after resampling.")
+                R = train_resampled.loc[common]
+                F = factors.loc[common]
+            except Exception:
+                # fallback: intersect original indices (will raise below if empty)
+                R = train_returns.loc[common]
+                F = factors.loc[common]
+        else:
+            R = train_returns.loc[common]
+            F = factors.loc[common]
+    
+        if len(common) == 0:
+            raise RuntimeError("No overlapping dates between train_returns and factors. Cannot build factor covariance.")
+    
+        if F.shape[1] == 0:
+            raise RuntimeError("Factor DataFrame has zero columns.")
+    
+        # Fit betas asset-by-asset
+        B_list = []
+        resid_vars = []
+        reg = LinearRegression()
+        T = F.shape[0]
+        for col in R.columns:
+            y = R[col].dropna()
+            # align y with F
+            idx = y.index.intersection(F.index)
+            if len(idx) == 0:
+                # asset has no overlapping observations with factors
+                # set small residual variance and zero betas
+                B_list.append(np.zeros(F.shape[1]))
+                resid_vars.append(1e-8)
+                continue
+            X = F.loc[idx].values
+            yy = y.loc[idx].values
+            if X.shape[0] < (F.shape[1] + 1):
+                # too few obs to fit reliably: fallback to OLS with ridge-like damping or zeros betas
+                try:
+                    reg.fit(X, yy)
+                except Exception:
+                    beta = np.zeros(F.shape[1])
+                    resid = yy - np.zeros_like(yy)
+                    var_resid = np.var(resid, ddof=1) if len(resid) > 1 else max(np.var(yy, ddof=1) if len(yy) > 1 else 1e-8, 1e-8)
+                    B_list.append(beta)
+                    resid_vars.append(var_resid * self._ann_fac)
+                    continue
+            else:
+                reg.fit(X, yy)
+            beta = reg.coef_.reshape(-1)
+            resid = yy - reg.predict(X)
+            var_resid = np.var(resid, ddof=1) if len(resid) > 1 else max(np.var(yy, ddof=1) if len(yy) > 1 else 1e-8, 1e-8)
+            B_list.append(beta)
+            resid_vars.append(var_resid * self._ann_fac)  # annualize residual var
+    
+        B = np.vstack(B_list)  # shape (N_assets, n_factors)
+        Sigma_f = F.cov().values * self._ann_fac
+        D = np.diag(resid_vars)
+    
+        Sigma = B @ Sigma_f @ B.T + D
+        Sigma = (Sigma + Sigma.T) / 2.0
+    
+        # ensure PD by eigenvalue clipping
+        try:
+            np.linalg.cholesky(Sigma)
+        except np.linalg.LinAlgError:
+            Sigma = self.nearest_positive_definite(Sigma)
+    
+        return pd.DataFrame(Sigma, index=R.columns, columns=R.columns)
+
+
+    # -----------------------
+    # Covariance diagnostics
+    # -----------------------
+    def covariance_diagnostics(self, raw_cov, fixed_cov, eps=1e-12):
+        A = np.asarray(raw_cov)
+        B = np.asarray(fixed_cov)
+
+        frob_dist = np.linalg.norm(B - A, ord='fro')
+        denom = np.linalg.norm(A, ord='fro')
+        frob_rel = float(frob_dist / denom) if denom > eps else np.nan
+
+        eig_raw = np.linalg.eigvalsh(A)
+        eig_fix = np.linalg.eigvalsh(B)
+
+        neg_raw = eig_raw[eig_raw < 0]
+        pos_fix_sum = eig_fix[eig_fix > 0].sum()
+        if pos_fix_sum <= eps:
+            neg_ratio = np.nan
+        else:
+            neg_ratio = float(abs(neg_raw.sum()) / pos_fix_sum) if neg_raw.size > 0 else 0.0
+
+        min_eig_fix = float(eig_fix.min())
+        if abs(min_eig_fix) < 1e-14:
+            min_eig_fix = 0.0
+
+        return {
+            "frob_relative_change": frob_rel,
+            "min_eigen_raw": float(eig_raw.min()),
+            "min_eigen_fixed": min_eig_fix,
+            "num_negative_raw": int(np.sum(eig_raw < 0)),
+            "neg_variance_ratio": neg_ratio
+        }
+
+    def nearest_positive_definite(self, A, eps=1e-8):
+        """
+        Make A symmetric and then force positive semidefinite by eigenvalue clipping.
+        Returns a symmetric PSD matrix (not iterative).
+        """
+        A = np.asarray(A, dtype=float)
+        A = (A + A.T) / 2.0
+        # eigh for symmetric/hermitian matrices
+        vals, vecs = np.linalg.eigh(A)
+        # clip eigenvalues to small positive value
+        vals_clipped = np.clip(vals, a_min=eps, a_max=None)
+        A_pd = (vecs @ np.diag(vals_clipped) @ vecs.T)
+        # enforce symmetry
+        A_pd = (A_pd + A_pd.T) / 2.0
+        return A_pd
+
+
+    
+    """
+    def nearest_positive_definite(self, A):
+        B = (A + A.T) / 2
+        _, s, V = np.linalg.svd(B)
+        H = V.T @ np.diag(s) @ V
+        A3 = (B + H) / 2
+        A3 = (A3 + A3.T) / 2
+
+        def is_pd(X):
+            try:
+                _ = np.linalg.cholesky(X)
+                return True
+            except np.linalg.LinAlgError:
+                return False
+
+        if is_pd(A3):
+            pass
+        else:
+            n = A.shape[0]
+            spacing = np.spacing(np.linalg.norm(A))
+            I = np.eye(n)
+            k = 1
+            while not is_pd(A3):
+                min_eig = np.min(np.real(np.linalg.eigvals(A3)))
+                jitter = I * (-min_eig * k**2 + spacing)
+                A3 += jitter
+                k += 1
+                if k > 1000:
+                    raise RuntimeError("Failed to make matrix positive definite")
+
+        # tiny jitter to ensure strict PD
+        min_eig = np.min(np.real(np.linalg.eigvals(A3)))
+        if min_eig <= 0:
+            A3 += (-min_eig + 1e-12) * np.eye(A3.shape[0])
+
+        return (A3 + A3.T) / 2
+    """
+    
     # -----------------------
     # Pairwise means & cov
     # -----------------------
@@ -131,35 +428,6 @@ class PortfolioOptimizerV2:
         self.ann_geometric = pd.Series(mu)
         return self.ann_geometric
 
-    def nearest_positive_definite(self, A):
-        B = (A + A.T) / 2
-        _, s, V = np.linalg.svd(B)
-        H = V.T @ np.diag(s) @ V
-        A2 = (B + H) / 2
-        A3 = (A2 + A2.T) / 2
-
-        def is_pd(X):
-            try:
-                _ = np.linalg.cholesky(X)
-                return True
-            except np.linalg.LinAlgError:
-                return False
-
-        if is_pd(A3):
-            return A3
-
-        n = A.shape[0]
-        spacing = np.spacing(np.linalg.norm(A))
-        I = np.eye(n)
-        k = 1
-        while not is_pd(A3):
-            min_eig = np.min(np.real(np.linalg.eigvals(A3)))
-            jitter = I * (-min_eig * k**2 + spacing)
-            A3 += jitter
-            k += 1
-            if k > 1000:
-                raise RuntimeError("Failed to make matrix positive definite")
-        return A3
 
     def pairwise_covariance(self, min_obs=1, fill_method='single_factor'):
         assets = list(self.returns.columns)
@@ -184,44 +452,49 @@ class PortfolioOptimizerV2:
         cov = cov * self._ann_fac
 
         if cov.isna().values.any():
-            diag = np.diag(cov.fillna(0).values)
-            var_vec = pd.Series(diag, index=assets)
+            assets = cov.index.tolist()
+            # compute sample variances where available
+            var_vec = pd.Series({a: np.nan for a in assets})
             for a in assets:
-                if var_vec[a] == 0 or np.isnan(var_vec[a]):
-                    s = self.returns[a].dropna()
-                    var_vec[a] = s.var(ddof=1) * self._ann_fac if len(s) > 1 else 1e-8
-
-            if fill_method in ('diagonal', 'zero'):
-                for i in assets:
-                    for j in assets:
-                        if pd.isna(cov.loc[i, j]):
-                            cov.loc[i, j] = var_vec[i] if i == j else 0.0
-            else:
-                cors = []
-                for i in assets:
-                    for j in assets:
-                        if i == j:
-                            continue
-                        if not pd.isna(cov.loc[i, j]):
-                            denom = np.sqrt(var_vec[i] * var_vec[j])
-                            if denom > 0:
-                                cors.append(cov.loc[i, j] / denom)
-                rho_bar = np.nanmean(cors) if len(cors) > 0 else 0.0
-                sigma = np.sqrt(var_vec)
-                for i in assets:
-                    for j in assets:
-                        if pd.isna(cov.loc[i, j]):
-                            cov.loc[i, j] = rho_bar * sigma[i] * sigma[j]
-
-        cov = (cov + cov.T) / 2
+                s = self.returns[a].dropna()
+                var_vec[a] = s.var(ddof=1) * self._ann_fac if len(s) > 1 else np.nan
+        
+            # Replace NaN variances with a stable small floor: e.g., median_var * 1e-3 or absolute floor
+            median_var = var_vec.dropna().median() if var_vec.dropna().size > 0 else 1e-6
+            floor = max(median_var * 1e-6, 1e-8)
+            var_vec = var_vec.fillna(floor)
+        
+            # Robust rho_bar: compute correlations from observed pairs only (upper triangle)
+            cors = []
+            for i in range(N):
+                for j in range(i + 1, N):
+                    if not pd.isna(cov.iat[i, j]):
+                        denom = np.sqrt(var_vec.iloc[i] * var_vec.iloc[j])
+                        if denom > 0:
+                            cors.append(cov.iat[i, j] / denom)
+            rho_bar = float(np.nanmean(cors)) if len(cors) > 0 else 0.0
+            if not np.isfinite(rho_bar):
+                rho_bar = 0.0
+        
+            sigma = np.sqrt(var_vec.values)
+            for i in range(N):
+                for j in range(N):
+                    if pd.isna(cov.iat[i, j]):
+                        cov.iat[i, j] = (rho_bar * sigma[i] * sigma[j]) if i != j else var_vec.iloc[i]
+        
+        cov = (cov + cov.T) / 2.0
+        
+        # final PD check + fix
         try:
             _ = np.linalg.cholesky(cov.values)
             cov_pd = cov.values
         except np.linalg.LinAlgError:
             cov_pd = self.nearest_positive_definite(cov.values)
-
+        
         self.cov_matrix = pd.DataFrame(cov_pd, index=assets, columns=assets)
         return self.cov_matrix
+
+
 
     # -----------------------
     # Compute stats
@@ -381,6 +654,7 @@ class PortfolioOptimizerV2:
         self.cov_matrix = pd.DataFrame(S * self._ann_fac, index=self.returns.columns, columns=self.returns.columns)
         return self.cov_matrix
 
+    
     # -----------------------
     # Portfolio metrics & classical optimizers
     # -----------------------
@@ -550,8 +824,9 @@ class PortfolioOptimizerV2:
         perf = self.portfolio_performance(w)
         return w, perf, res
 
+
     # -----------------------
-    # Rolling backtest (walk forward)
+    # Rolling backtest (walk forward) with covariance diagnostics
     # -----------------------
     def rolling_backtest(self, window=252, rebalance_freq=21,
                          method='sharpe', bounds=None,
@@ -571,6 +846,9 @@ class PortfolioOptimizerV2:
         # start from equal weights
         prev_weights = np.ones(self.num_assets) / self.num_assets
     
+        # initialize diagnostics storage
+        self.cov_diag_history = []
+    
         for i in range(0, len(returns) - window, rebalance_freq):
             train = returns.iloc[i:i + window]
             test = returns.iloc[i + window:i + window + rebalance_freq]
@@ -588,16 +866,39 @@ class PortfolioOptimizerV2:
                 prior = shrink_mean.get("prior", None)
                 self.shrink_means_empirical(prior=prior, lam=lam)
     
-            # covariance shrink
+            # -----------------------
+            # covariance estimator
+            # -----------------------
             if shrink_cov is not None:
-                if shrink_cov.get("method", "") == "ledoit_wolf":
+                method_cov = shrink_cov.get("method", "")
+    
+                if method_cov == "ledoit_wolf":
                     self.shrink_covariance_ledoit_wolf()
+    
+                elif method_cov == "ewma":
+                    hl = shrink_cov.get("halflife", 63)
+                    self.ewma_cov(halflife=hl)
+    
+                elif method_cov == "factor":
+                    factors = shrink_cov["factors"]
+                    self.cov_matrix = self.factor_covariance(train, factors)
+    
                 else:
-                    delta = shrink_cov.get("delta", 0.1)
+                    delta = shrink_cov.get("delta", 0.2)
                     ptype = shrink_cov.get("prior_type", "single_factor")
                     self.shrink_covariance(delta=delta, prior_type=ptype)
+    
             else:
                 self.cov_matrix = train.cov() * self._ann_fac
+    
+            # -----------------------
+            # covariance diagnostics
+            # -----------------------
+            raw_cov = train.cov() * self._ann_fac
+            fixed_cov = self.cov_matrix.copy()
+            diag = self.covariance_diagnostics(raw_cov, fixed_cov)
+            diag_record = {'start': train.index[0], 'end': train.index[-1], **diag}
+            self.cov_diag_history.append(diag_record)
     
             # -----------------------
             # choose optimization
@@ -605,7 +906,7 @@ class PortfolioOptimizerV2:
             if method == 'sharpe':
                 w, perf = self.optimize_sharpe(bounds=bounds)
     
-            elif method == 'sharpe_tc':   # <<< NEW
+            elif method == 'sharpe_tc':
                 w, perf = self.optimize_sharpe_with_turnover(
                     prev_weights=prev_weights,
                     gamma=gamma,
@@ -640,10 +941,25 @@ class PortfolioOptimizerV2:
             self.ann_geometric = old_mu
             self.cov_matrix = old_cov
     
-        flat = np.concatenate(portfolio_returns)
-        self.bt_returns = flat
+        # -----------------------
+        # finalize
+        # -----------------------
+        self.bt_returns = np.concatenate(portfolio_returns)
         self.bt_weights = np.vstack(weights_hist)
+    
+        # -----------------------
+        # print accumulated diagnostics summary
+        # -----------------------
+        diag_df = pd.DataFrame(self.cov_diag_history)
+        numeric_diag = diag_df.drop(columns=['start', 'end'])
+        summary = numeric_diag.agg(['mean', 'min', 'max', 'std'])
+    
+        print("\nCovariance diagnostics summary across all rolling windows:")
+        print(summary)
+    
         return self.bt_returns, self.bt_weights
+    
+    
 
 
     # -----------------------
