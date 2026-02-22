@@ -1117,8 +1117,21 @@ class PortfolioOptimizerV2:
                 continue
     
             # --- Bounds ---
-            bounds_local = [(0, 1)] * N_active
-    
+            if bounds is None:
+                bounds_local = [(0, 1)] * N_active
+            else:
+                if len(bounds) != full_N:
+                    raise ValueError("Length of bounds must match full asset universe.")
+
+                if N_active == 1:
+                    bounds_local = [(1.0, 1.0)]
+                else:
+                    bounds_local = [
+                        bounds[full_assets.index(asset)]
+                        for asset in active_assets
+                    ]
+            
+            #bounds_local = [(0, 1)] * N_active
             # Map previous full weights to active
             prev_active = np.array([
                 prev_weights_full[full_assets.index(a)]
